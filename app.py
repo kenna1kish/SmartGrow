@@ -24,6 +24,7 @@ import os
 import base64
 import json
 from datetime import datetime
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -56,6 +57,10 @@ MPESA_CONSUMER_SECRET = os.environ.get("MPESA_CONSUMER_SECRET", "").strip()
 MPESA_SHORTCODE = os.environ.get("MPESA_SHORTCODE", "").strip()
 MPESA_PASSKEY = os.environ.get("MPESA_PASSKEY", "").strip()
 MPESA_CALLBACK_URL = os.environ.get("MPESA_CALLBACK_URL", "").strip()
+MPESA_INITIATOR_NAME = os.environ.get("MPESA_INITIATOR_NAME", "").strip()
+MPESA_SECURITY_CREDENTIAL = os.environ.get("MPESA_SECURITY_CREDENTIAL", "").strip()
+MPESA_B2C_SHORTCODE = os.environ.get("MPESA_B2C_SHORTCODE", "").strip()
+MPESA_B2C_TEST_PHONE = os.environ.get("MPESA_B2C_TEST_PHONE", "").strip()
 MPESA_BASE_URL = (
     "https://sandbox.safaricom.co.ke"
     if MPESA_ENVIRONMENT == "sandbox"
@@ -190,6 +195,15 @@ def initialize_database():
         connection.execute("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS result_code TEXT")
         connection.execute("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS callback_payload JSONB")
         connection.execute("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS stk_timestamp TEXT")
+        # B2C payout tracking. A payout is sent only after an admin approves it.
+        connection.execute("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS phone TEXT")
+        connection.execute("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS originator_conversation_id TEXT")
+        connection.execute("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS conversation_id TEXT")
+        connection.execute("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS mpesa_receipt TEXT")
+        connection.execute("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS result_code TEXT")
+        connection.execute("ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS callback_payload JSONB")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS withdrawals_originator_unique ON withdrawals(originator_conversation_id) WHERE originator_conversation_id IS NOT NULL")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS withdrawals_receipt_unique ON withdrawals(mpesa_receipt) WHERE mpesa_receipt IS NOT NULL")
         connection.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS deposit_checkout_request_unique
             ON deposit_requests (checkout_request_id)
@@ -1754,8 +1768,7 @@ def admin_dashboard():
             {% endif %}
         </div>
         <div class="notice">
-            Review every withdrawal request before making
-            a decision. Approval does not send money.
+            Approval sends a B2C payment request. A request is marked Paid only after Safaricom confirms success.
         </div>
 
         <div class="card">
@@ -1905,28 +1918,162 @@ def review_withdrawal(withdrawal_id):
         flash("This request has already been reviewed.", "error")
         return redirect(url_for("admin_dashboard"))
 
-    connection.execute(
-        """
-        UPDATE withdrawals
-        SET status = ?,
-            reviewed_at = CURRENT_TIMESTAMP,
-            admin_note = ?
-        WHERE id = ?
-          AND status = 'Pending'
-        """,
-        (decision, admin_note, withdrawal_id)
-    )
+    if decision == "Rejected":
+        connection.execute("UPDATE withdrawals SET status='Rejected', reviewed_at=CURRENT_TIMESTAMP, admin_note=? WHERE id=? AND status='Pending'", (admin_note, withdrawal_id))
+        connection.commit()
+        connection.close()
+        flash("Withdrawal rejected.", "success")
+        return redirect(url_for("admin_dashboard"))
 
+    # Claim the request atomically before contacting Safaricom, preventing double sends.
+    details = connection.execute("""
+        SELECT w.id, w.user_id, w.amount, u.phone
+        FROM withdrawals w JOIN users u ON u.id=w.user_id WHERE w.id=?
+    """, (withdrawal_id,)).fetchone()
+    if not details:
+        connection.close()
+        flash("Withdrawal request not found.", "error")
+        return redirect(url_for("admin_dashboard"))
+    if not all((MPESA_INITIATOR_NAME, MPESA_SECURITY_CREDENTIAL, MPESA_B2C_SHORTCODE)):
+        connection.close()
+        flash("B2C credentials are incomplete. No payment was sent.", "error")
+        return redirect(url_for("admin_dashboard"))
+    if not MPESA_CALLBACK_URL.startswith("https://"):
+        connection.close()
+        flash("Set MPESA_CALLBACK_URL to the HTTPS Render callback base URL first.", "error")
+        return redirect(url_for("admin_dashboard"))
+    target_phone = MPESA_B2C_TEST_PHONE if MPESA_ENVIRONMENT == "sandbox" and MPESA_B2C_TEST_PHONE else details["phone"]
+    target_phone = normalize_mpesa_phone(target_phone)
+    if not target_phone:
+        connection.close()
+        flash("The member or sandbox test phone number is invalid. No payment was sent.", "error")
+        return redirect(url_for("admin_dashboard"))
+    originator_id = "SG" + secrets.token_hex(8).upper()
+    claimed = connection.execute("""
+        UPDATE withdrawals SET status='Processing', reviewed_at=CURRENT_TIMESTAMP, admin_note=?, phone=?, originator_conversation_id=?
+        WHERE id=? AND status='Pending' RETURNING id
+    """, (admin_note, target_phone, originator_id, withdrawal_id)).fetchone()
+    if not claimed:
+        connection.rollback()
+        connection.close()
+        flash("This withdrawal has already been processed by another request.", "error")
+        return redirect(url_for("admin_dashboard"))
     connection.commit()
     connection.close()
 
-    flash(
-        "Withdrawal request marked " + decision + ".",
-        "success"
-    )
+    try:
+        token = mpesa_access_token()
+        callback_parts = urlparse(MPESA_CALLBACK_URL)
+        callback_origin = f"{callback_parts.scheme}://{callback_parts.netloc}"
+        payload = {
+            "InitiatorName": MPESA_INITIATOR_NAME,
+            "SecurityCredential": MPESA_SECURITY_CREDENTIAL,
+            "CommandID": "BusinessPayment",
+            "Amount": int(float(details["amount"])),
+            "PartyA": MPESA_B2C_SHORTCODE,
+            "PartyB": target_phone,
+            "Remarks": f"SmartGrow withdrawal {withdrawal_id}",
+            "QueueTimeOutURL": callback_origin + "/mpesa/b2c/timeout",
+            "ResultURL": callback_origin + "/mpesa/b2c/result",
+            "Occasion": f"Withdrawal {withdrawal_id}"
+        }
+        response = requests.post(f"{MPESA_BASE_URL}/mpesa/b2c/v1/paymentrequest", json=payload, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, timeout=35)
+        response.raise_for_status()
+        data = response.json()
+        if str(data.get("ResponseCode")) != "0":
+            raise RuntimeError(data.get("ResponseDescription", "Safaricom rejected the B2C request."))
+        connection = get_db()
+        connection.execute("UPDATE withdrawals SET conversation_id=? WHERE id=? AND originator_conversation_id=?", (data.get("ConversationID"), withdrawal_id, originator_id))
+        connection.commit()
+        connection.close()
+        flash("B2C payout request accepted by Safaricom. Awaiting final callback confirmation.", "success")
+    except Exception as exc:
+        app.logger.exception("B2C payout initiation failed for withdrawal %s", withdrawal_id)
+        connection = get_db()
+        connection.execute("UPDATE withdrawals SET status='Review', admin_note=COALESCE(admin_note,'') || ' | B2C initiation error; verify status before retry: ' || ? WHERE id=? AND originator_conversation_id=?", (str(exc)[:300], withdrawal_id, originator_id))
+        connection.commit()
+        connection.close()
+        flash("Safaricom did not confirm the payout request. It has been placed on Review; do not retry until checked.", "error")
 
     return redirect(url_for("admin_dashboard"))
 
+
+# ============================================================
+# M-PESA B2C PAYOUT CALLBACKS
+# ============================================================
+
+def normalize_mpesa_phone(value):
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if digits.startswith("0") and len(digits) == 10:
+        return "254" + digits[1:]
+    if digits.startswith("7") and len(digits) == 9:
+        return "254" + digits
+    if digits.startswith("254") and len(digits) == 12:
+        return digits
+    return ""
+
+def mpesa_access_token():
+    if not all((MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET)):
+        raise RuntimeError("M-Pesa consumer credentials are missing.")
+    response = requests.get(
+        f"{MPESA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials",
+        auth=(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET), timeout=30
+    )
+    response.raise_for_status()
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("Safaricom did not return an access token.")
+    return token
+
+@app.route("/mpesa/b2c/result", methods=["POST"])
+def mpesa_b2c_result():
+    body = request.get_json(silent=True) or {}
+    result = body.get("Result") or {}
+    originator_id = result.get("OriginatorConversationID")
+    result_code = result.get("ResultCode")
+    params = {}
+    for item in ((result.get("ResultParameters") or {}).get("ResultParameter") or []):
+        if item.get("Key"):
+            params[item["Key"]] = item.get("Value")
+    if not originator_id:
+        app.logger.warning("B2C result callback missing OriginatorConversationID")
+        return {"Result": "Accepted"}, 200
+    connection = get_db()
+    try:
+        row = connection.execute("SELECT id, user_id, amount, status FROM withdrawals WHERE originator_conversation_id = ?", (originator_id,)).fetchone()
+        if not row:
+            app.logger.warning("Unknown B2C originator ID: %s", originator_id)
+            return {"Result": "Accepted"}, 200
+        if row["status"] in ("Paid", "Rejected"):
+            return {"Result": "Accepted"}, 200
+        if str(result_code) == "0":
+            receipt = str(params.get("TransactionReceipt") or result.get("TransactionID") or "")
+            connection.execute("UPDATE withdrawals SET status='Paid', mpesa_receipt=?, result_code=?, callback_payload=?::jsonb, reviewed_at=CURRENT_TIMESTAMP WHERE id=? AND status='Processing'", (receipt or None, str(result_code), json.dumps(body), row["id"]))
+            connection.commit()
+        else:
+            connection.execute("UPDATE withdrawals SET status='Failed', result_code=?, callback_payload=?::jsonb, admin_note=COALESCE(admin_note,'') || ' | B2C failed: ' || ?, reviewed_at=CURRENT_TIMESTAMP WHERE id=? AND status='Processing'", (str(result_code), json.dumps(body), str(result.get("ResultDesc", "Unknown B2C failure"))[:300], row["id"]))
+            connection.commit()
+        return {"Result": "Accepted"}, 200
+    except Exception:
+        connection.rollback()
+        app.logger.exception("Could not process B2C result callback")
+        return {"Result": "Accepted"}, 200
+    finally:
+        connection.close()
+
+@app.route("/mpesa/b2c/timeout", methods=["POST"])
+def mpesa_b2c_timeout():
+    body = request.get_json(silent=True) or {}
+    result = body.get("Result") or {}
+    originator_id = result.get("OriginatorConversationID")
+    if originator_id:
+        connection = get_db()
+        try:
+            connection.execute("UPDATE withdrawals SET status='Review', callback_payload=?::jsonb, admin_note=COALESCE(admin_note,'') || ' | B2C timeout; verify transaction status before retrying.' WHERE originator_conversation_id=? AND status='Processing'", (json.dumps(body), originator_id))
+            connection.commit()
+        finally:
+            connection.close()
+    return {"Result": "Accepted"}, 200
 
 # ============================================================
 # ADMIN LOGOUT
