@@ -21,7 +21,12 @@ from flask import (
 
 import secrets
 import os
+import base64
+import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
+import requests
 import psycopg
 from psycopg.rows import dict_row
 
@@ -44,6 +49,19 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing. Add your Neon PostgreSQL connection string in Render environment variables.")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+MPESA_ENVIRONMENT = os.environ.get("MPESA_ENVIRONMENT", "sandbox").strip().lower()
+MPESA_CONSUMER_KEY = os.environ.get("MPESA_CONSUMER_KEY", "").strip()
+MPESA_CONSUMER_SECRET = os.environ.get("MPESA_CONSUMER_SECRET", "").strip()
+MPESA_SHORTCODE = os.environ.get("MPESA_SHORTCODE", "").strip()
+MPESA_PASSKEY = os.environ.get("MPESA_PASSKEY", "").strip()
+MPESA_CALLBACK_URL = os.environ.get("MPESA_CALLBACK_URL", "").strip()
+MPESA_BASE_URL = (
+    "https://sandbox.safaricom.co.ke"
+    if MPESA_ENVIRONMENT == "sandbox"
+    else "https://api.safaricom.co.ke"
+)
+
 
 
 # Small compatibility wrapper: the existing app uses SQLite-style ? placeholders.
@@ -165,6 +183,19 @@ def initialize_database():
         """)
 
         # Enforce uniqueness even when usernames differ only by letter case.
+        # M-Pesa STK tracking columns; safe for both fresh and existing Neon databases.
+        connection.execute("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS checkout_request_id TEXT")
+        connection.execute("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS merchant_request_id TEXT")
+        connection.execute("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS mpesa_receipt TEXT")
+        connection.execute("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS result_code TEXT")
+        connection.execute("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS callback_payload JSONB")
+        connection.execute("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS stk_timestamp TEXT")
+        connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS deposit_checkout_request_unique
+            ON deposit_requests (checkout_request_id)
+            WHERE checkout_request_id IS NOT NULL
+        """)
+
         connection.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS users_username_case_unique
             ON users (LOWER(username))
@@ -1182,66 +1213,20 @@ def wallet():
             </div>
 
             <p class="muted">
-                Only verified deposits approved by the administrator
-                will be added to your available balance.
+                Only successful M-Pesa payments confirmed by Safaricom are added to your available balance.
             </p>
         </div>
 
         <div class="card">
 
-            <h2>Deposit Money</h2>
-
-            <p>
-                Submit a deposit request. Payments are not
-                automatically verified at this stage.
-            </p>
-
-            <form method="POST"
-                  action="{{ url_for('wallet_deposit') }}">
-
+            <h2>Deposit with M-Pesa</h2>
+            <p>Enter the amount. An M-Pesa STK prompt will be sent to your registered phone number.</p>
+            <form method="POST" action="{{ url_for('wallet_deposit') }}">
                 <label>Deposit Amount (KES)</label>
-
-                <input
-                    type="number"
-                    name="amount"
-                    min="1"
-                    step="1"
-                    required
-                >
-
-                <br><br>
-
-                <label>Payment Method</label>
-
-                <select name="payment_method" required>
-                    <option value="Manual">Manual / Pending M-Pesa Integration</option>
-                </select>
-
-                <br><br>
-
-                <label>Payment Reference (if available)</label>
-
-                <input
-                    type="text"
-                    name="payment_reference"
-                    maxlength="100"
-                    placeholder="Enter transaction code if available"
-                >
-
-                <br><br>
-
-                <button type="submit">
-                    Submit Deposit Request
-                </button>
-
+                <input type="number" name="amount" min="1" step="1" required>
+                <button type="submit">Pay with M-Pesa</button>
             </form>
-
-            <p class="muted">
-                Do not submit a payment reference unless it relates
-                to a genuine payment. Submitting a request does not
-                mean your wallet has been credited.
-            </p>
-
+            <p class="muted">Your wallet is credited only after Safaricom confirms successful payment. Never share your M-Pesa PIN.</p>
         </div>
 
         <div class="card">
@@ -1383,81 +1368,236 @@ def wallet():
 # SUBMIT A WALLET DEPOSIT REQUEST
 # ============================================================
 
+def mpesa_access_token():
+    if not all((MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET)):
+        raise RuntimeError("M-Pesa consumer credentials are not configured.")
+    response = requests.get(
+        f"{MPESA_BASE_URL}/oauth/v1/generate?grant_type=client_credentials",
+        auth=(MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET),
+        timeout=25
+    )
+    response.raise_for_status()
+    token = response.json().get("access_token")
+    if not token:
+        raise RuntimeError("Daraja did not return an access token.")
+    return token
+
+
+def normalize_mpesa_phone(phone):
+    phone = "".join(ch for ch in str(phone or "") if ch.isdigit())
+    if phone.startswith("0") and len(phone) == 10:
+        return "254" + phone[1:]
+    if phone.startswith("254") and len(phone) == 12:
+        return phone
+    if phone.startswith("7") and len(phone) == 9:
+        return "254" + phone
+    return None
+
+
 @app.route("/wallet/deposit", methods=["POST"])
 def wallet_deposit():
-
     if "user_id" not in session:
         flash("Please log in first.", "error")
         return redirect(url_for("login"))
 
-    amount_text = request.form.get("amount", "").strip()
-    payment_method = request.form.get(
-        "payment_method", "Manual"
-    ).strip()
-
-    payment_reference = request.form.get(
-        "payment_reference", ""
-    ).strip()
-
-    if len(payment_reference) > 100:
-        flash("The payment reference is too long.", "error")
-        return redirect(url_for("wallet"))
-
     try:
-        amount = float(amount_text)
-
-        if amount <= 0 or not amount.is_integer():
+        amount = int(request.form.get("amount", "").strip())
+        if amount <= 0:
             raise ValueError
-
     except (ValueError, TypeError):
-        flash(
-            "Enter a valid positive deposit amount in whole KES.",
-            "error"
-        )
+        flash("Enter a valid positive deposit amount in whole KES.", "error")
         return redirect(url_for("wallet"))
 
-    # Payments are not yet connected to M-Pesa.
-    # Only create a pending request; do not credit the wallet here.
+    if not all((MPESA_CONSUMER_KEY, MPESA_CONSUMER_SECRET, MPESA_SHORTCODE, MPESA_PASSKEY)):
+        flash("M-Pesa is not fully configured. Please contact support.", "error")
+        return redirect(url_for("wallet"))
+    if not MPESA_CALLBACK_URL.startswith("https://"):
+        flash("M-Pesa callback address is not configured yet. Please try again later.", "error")
+        return redirect(url_for("wallet"))
 
     connection = get_db()
-
     try:
+        user = connection.execute(
+            "SELECT phone FROM users WHERE id = ?", (session["user_id"],)
+        ).fetchone()
+        phone = normalize_mpesa_phone(user["phone"] if user else None)
+        if not phone:
+            flash("Your account does not have a valid registered M-Pesa number. Update your number before depositing.", "error")
+            return redirect(url_for("wallet"))
+
+        token = mpesa_access_token()
+        timestamp = datetime.now(ZoneInfo("Africa/Nairobi")).strftime("%Y%m%d%H%M%S")
+        password = base64.b64encode(
+            f"{MPESA_SHORTCODE}{MPESA_PASSKEY}{timestamp}".encode("utf-8")
+        ).decode("utf-8")
+
+        payload = {
+            "BusinessShortCode": MPESA_SHORTCODE,
+            "Password": password,
+            "Timestamp": timestamp,
+            "TransactionType": "CustomerPayBillOnline",
+            "Amount": amount,
+            "PartyA": phone,
+            "PartyB": MPESA_SHORTCODE,
+            "PhoneNumber": phone,
+            "CallBackURL": MPESA_CALLBACK_URL,
+            "AccountReference": "SmartGrow",
+            "TransactionDesc": "SmartGrow wallet deposit"
+        }
+        response = requests.post(
+            f"{MPESA_BASE_URL}/mpesa/stkpush/v1/processrequest",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30
+        )
+        result = response.json()
+        if response.status_code >= 400 or result.get("ResponseCode") != "0":
+            app.logger.error("Daraja STK request rejected: %s", result)
+            flash(result.get("errorMessage") or result.get("ResponseDescription") or "Safaricom could not start the payment. Please try again.", "error")
+            return redirect(url_for("wallet"))
+
         connection.execute("""
             INSERT INTO deposit_requests (
-                user_id,
-                amount,
-                payment_method,
-                payment_reference,
-                status
-            )
-            VALUES (?, ?, ?, ?, 'Pending')
+                user_id, amount, payment_method, status,
+                checkout_request_id, merchant_request_id, stk_timestamp
+            ) VALUES (?, ?, 'M-Pesa STK', 'Pending', ?, ?, ?)
         """, (
-            session["user_id"],
-            amount,
-            payment_method,
-            payment_reference or None
+            session["user_id"], amount,
+            result.get("CheckoutRequestID"), result.get("MerchantRequestID"), timestamp
         ))
+        connection.commit()
+        flash("M-Pesa prompt sent. Enter your M-Pesa PIN on your phone. Your wallet will update after Safaricom confirms payment.", "success")
+    except requests.RequestException as exc:
+        connection.rollback()
+        app.logger.exception("M-Pesa STK network error: %s", exc)
+        flash("Could not connect to M-Pesa. Please try again.", "error")
+    except Exception as exc:
+        connection.rollback()
+        app.logger.exception("M-Pesa deposit setup failed: %s", exc)
+        flash("Could not start the M-Pesa payment. Please try again.", "error")
+    finally:
+        connection.close()
+    return redirect(url_for("wallet"))
+
+
+def verify_stk_payment_with_daraja(checkout_request_id, timestamp):
+    token = mpesa_access_token()
+    password = base64.b64encode(
+        f"{MPESA_SHORTCODE}{MPESA_PASSKEY}{timestamp}".encode("utf-8")
+    ).decode("utf-8")
+    response = requests.post(
+        f"{MPESA_BASE_URL}/mpesa/stkpushquery/v1/query",
+        json={
+            "BusinessShortCode": MPESA_SHORTCODE,
+            "Password": password,
+            "Timestamp": timestamp,
+            "CheckoutRequestID": checkout_request_id
+        },
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=25
+    )
+    response.raise_for_status()
+    result = response.json()
+    return str(result.get("ResultCode")) == "0", result
+
+
+@app.route("/mpesa/callback", methods=["POST"])
+def mpesa_callback():
+    body = request.get_json(silent=True) or {}
+    callback = (body.get("Body") or {}).get("stkCallback") or {}
+    checkout_id = callback.get("CheckoutRequestID")
+    result_code = callback.get("ResultCode")
+    metadata_items = ((callback.get("CallbackMetadata") or {}).get("Item") or [])
+    metadata = {item.get("Name"): item.get("Value") for item in metadata_items if isinstance(item, dict)}
+    receipt = metadata.get("MpesaReceiptNumber")
+    paid_amount = metadata.get("Amount")
+    paid_phone = normalize_mpesa_phone(metadata.get("PhoneNumber"))
+
+    if not checkout_id:
+        app.logger.warning("M-Pesa callback received without CheckoutRequestID")
+        return {"Result": "Ignored"}, 200
+
+    connection = get_db()
+    try:
+        deposit = connection.execute("""
+            SELECT id, user_id, amount, status, stk_timestamp
+            FROM deposit_requests
+            WHERE checkout_request_id = ?
+            FOR UPDATE
+        """, (checkout_id,)).fetchone()
+
+        if not deposit:
+            app.logger.warning("M-Pesa callback has unknown checkout ID: %s", checkout_id)
+            connection.commit()
+            return {"Result": "Unknown checkout"}, 200
+
+        if deposit["status"] == "Completed":
+            connection.commit()
+            return {"Result": "Already processed"}, 200
+
+        # Independently query Daraja using the original STK timestamp before crediting.
+        if str(result_code) == "0":
+            try:
+                verified, query_result = verify_stk_payment_with_daraja(
+                    checkout_id, deposit["stk_timestamp"]
+                )
+                if not verified:
+                    app.logger.error("Daraja STK query did not confirm payment: %s", query_result)
+                    connection.rollback()
+                    return {"Result": "Payment not independently verified"}, 500
+            except Exception:
+                connection.rollback()
+                app.logger.exception("Unable to independently verify M-Pesa payment")
+                return {"Result": "Verification temporarily unavailable"}, 500
+
+        if str(result_code) == "0" and receipt and paid_amount is not None:
+            user = connection.execute(
+                "SELECT phone FROM users WHERE id = ?", (deposit["user_id"],)
+            ).fetchone()
+            expected_phone = normalize_mpesa_phone(user["phone"] if user else None)
+            if int(float(paid_amount)) != int(float(deposit["amount"])) or paid_phone != expected_phone:
+                connection.execute("""
+                    UPDATE deposit_requests
+                    SET status = 'Review', result_code = ?, callback_payload = ?::jsonb,
+                        admin_note = 'Successful callback did not match expected amount or phone.'
+                    WHERE id = ?
+                """, (str(result_code), json.dumps(body), deposit["id"]))
+                connection.commit()
+                app.logger.error("M-Pesa callback mismatch for deposit %s", deposit["id"])
+                return {"Result": "Received for review"}, 200
+
+            reference = f"MPESA:{receipt}"
+            connection.execute("""
+                INSERT INTO wallet_transactions
+                    (user_id, transaction_type, amount, reference, description)
+                VALUES (?, 'Deposit', ?, ?, 'Verified M-Pesa STK deposit')
+                ON CONFLICT (reference) DO NOTHING
+            """, (deposit["user_id"], float(deposit["amount"]), reference))
+            connection.execute("""
+                UPDATE deposit_requests
+                SET status = 'Completed', payment_reference = ?, mpesa_receipt = ?,
+                    result_code = ?, callback_payload = ?::jsonb, reviewed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (receipt, receipt, str(result_code), json.dumps(body), deposit["id"]))
+        else:
+            connection.execute("""
+                UPDATE deposit_requests
+                SET status = 'Failed', result_code = ?, callback_payload = ?::jsonb,
+                    admin_note = ?
+                WHERE id = ?
+            """, (str(result_code), json.dumps(body), callback.get("ResultDesc", "Payment was not completed."), deposit["id"]))
 
         connection.commit()
-
-        flash(
-            "Deposit request submitted. Your wallet has not "
-            "been credited. The payment must be verified first.",
-            "success"
-        )
-
-    except psycopg.Error:
+    except Exception:
         connection.rollback()
-
-        flash(
-            "Unable to submit your deposit request. Please try again.",
-            "error"
-        )
-
+        app.logger.exception("Error processing M-Pesa callback")
+        return {"Result": "Callback processing error"}, 500
     finally:
         connection.close()
 
-    return redirect(url_for("wallet"))
+    return {"Result": "Accepted"}, 200
+
+
 # ============================================================
 # SMARTGROW ADMIN LOGIN
 # ============================================================
