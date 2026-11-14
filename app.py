@@ -1,7 +1,7 @@
 # ============================================================
 # SMARTGROW INVESTMENT
-# WEBSITE PROTOTYPE
-# Python + Flask + SQLite
+# WEBSITE
+# Python + Flask + Neon PostgreSQL
 #
 # IMPORTANT:
 # This is a development prototype.
@@ -19,9 +19,11 @@ from flask import (
     flash
 )
 
-import sqlite3
 import secrets
 import os
+
+import psycopg
+from psycopg.rows import dict_row
 
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -37,152 +39,148 @@ app.secret_key = os.environ.get(
     secrets.token_hex(32)
 )
 
-DATABASE = "smartgrow.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing. Add your Neon PostgreSQL connection string in Render environment variables.")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+# Small compatibility wrapper: the existing app uses SQLite-style ? placeholders.
+# This wrapper safely converts them to PostgreSQL %s placeholders.
+class DatabaseConnection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, query, params=()):
+        return self.connection.execute(query.replace("?", "%s"), params)
+
+    def commit(self):
+        return self.connection.commit()
+
+    def rollback(self):
+        return self.connection.rollback()
+
+    def close(self):
+        return self.connection.close()
+
 
 def get_db():
-    connection = sqlite3.connect(DATABASE)
-    connection.row_factory = sqlite3.Row
-    return connection
+    connection = psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        connect_timeout=15,
+        sslmode="require"
+    )
+    return DatabaseConnection(connection)
 
 
 def initialize_database():
     connection = get_db()
+    try:
+        # PostgreSQL is independent of Render's temporary application filesystem.
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                referral_code TEXT NOT NULL UNIQUE,
+                referred_by BIGINT REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                phone TEXT
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS investments (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                amount DOUBLE PRECISION NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS referral_rewards (
+                id BIGSERIAL PRIMARY KEY,
+                referrer_id BIGINT NOT NULL REFERENCES users(id),
+                referred_user_id BIGINT NOT NULL UNIQUE REFERENCES users(id),
+                amount DOUBLE PRECISION NOT NULL DEFAULT 50,
+                status TEXT NOT NULL DEFAULT 'credited',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS referral_withdrawals (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                amount DOUBLE PRECISION NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                amount DOUBLE PRECISION NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Pending',
+                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TIMESTAMP,
+                admin_note TEXT
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_transactions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                transaction_type TEXT NOT NULL,
+                amount DOUBLE PRECISION NOT NULL,
+                reference TEXT UNIQUE,
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS deposit_requests (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                amount DOUBLE PRECISION NOT NULL CHECK(amount > 0),
+                payment_method TEXT NOT NULL DEFAULT 'Manual',
+                payment_reference TEXT,
+                status TEXT NOT NULL DEFAULT 'Pending',
+                requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                reviewed_at TIMESTAMP,
+                admin_note TEXT
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS package_purchases (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                package_amount DOUBLE PRECISION NOT NULL,
+                duration_days INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Active',
+                purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL UNIQUE,
-            password TEXT NOT NULL,
-            referral_code TEXT NOT NULL UNIQUE,
-            referred_by INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (referred_by) REFERENCES users(id)
-        )
-    """)
-        # Add phone column to existing databases if missing
-    user_columns = connection.execute(
-        "PRAGMA table_info(users)"
-    ).fetchall()
-
-    if not any(column["name"] == "phone" for column in user_columns):
-        connection.execute(
-            "ALTER TABLE users ADD COLUMN phone TEXT"
-        )
-
-    connection.commit()
-    # ========================================================
-    # REFERRAL REWARDS
-    # ========================================================
-
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS investments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
-
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS referral_rewards (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id INTEGER NOT NULL,
-            referred_user_id INTEGER NOT NULL UNIQUE,
-            amount REAL NOT NULL DEFAULT 50,
-            status TEXT NOT NULL DEFAULT 'credited',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (referrer_id) REFERENCES users(id),
-            FOREIGN KEY (referred_user_id) REFERENCES users(id)
-        )
-    """)
-
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS referral_withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
-        # ========================================================
-    # WITHDRAWAL REQUESTS
-    # ========================================================
-
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS withdrawals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'Pending',
-            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            reviewed_at TIMESTAMP,
-            admin_note TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
-        # ========================================================
-    # SMARTGROW WALLET
-    # ========================================================
-
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS wallet_transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            transaction_type TEXT NOT NULL,
-            amount REAL NOT NULL,
-            reference TEXT UNIQUE,
-            description TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
-
-    # ========================================================
-    # DEPOSIT REQUESTS
-    # ========================================================
-
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS deposit_requests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            amount REAL NOT NULL CHECK(amount > 0),
-            payment_method TEXT NOT NULL DEFAULT 'Manual',
-            payment_reference TEXT,
-            status TEXT NOT NULL DEFAULT 'Pending',
-            requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            reviewed_at TIMESTAMP,
-            admin_note TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
-
-    # ========================================================
-    # PACKAGE PURCHASES
-    # ========================================================
-
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS package_purchases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            package_amount REAL NOT NULL,
-            duration_days INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'Active',
-            purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    """)
-
-    connection.commit()
-    connection.close()
+        # Enforce uniqueness even when usernames differ only by letter case.
+        connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS users_username_case_unique
+            ON users (LOWER(username))
+        """)
+        # Multiple legacy accounts may have NULL phone values; real numbers must be unique.
+        connection.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique
+            ON users (phone)
+            WHERE phone IS NOT NULL AND phone <> ''
+        """)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 initialize_database()
@@ -709,7 +707,7 @@ def register():
         connection = get_db()
 
         existing_user = connection.execute(
-            "SELECT id FROM users WHERE username = ?",
+            "SELECT id FROM users WHERE LOWER(username) = LOWER(?)",
             (username,)
         ).fetchone()
 
@@ -721,6 +719,19 @@ def register():
                 "error"
             )
 
+            return redirect(url_for("register"))
+
+        existing_phone = connection.execute(
+            "SELECT id FROM users WHERE phone = ?",
+            (phone,)
+        ).fetchone()
+
+        if existing_phone:
+            connection.close()
+            flash(
+                "That M-Pesa number is already registered. Please log in to your existing account.",
+                "error"
+            )
             return redirect(url_for("register"))
 
         # Validate referral code
@@ -762,23 +773,33 @@ def register():
         # Hash password
         hashed_password = generate_password_hash(password)
 
-        # Create account with M-Pesa phone number
-        connection.execute(
-            """
-            INSERT INTO users
-            (username, password, phone, referral_code, referred_by)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                username,
-                hashed_password,
-                phone,
-                referral_code,
-                referrer_id
+        # Create account. PostgreSQL unique indexes also protect against
+        # two simultaneous registration attempts using the same details.
+        try:
+            connection.execute(
+                """
+                INSERT INTO users
+                (username, password, phone, referral_code, referred_by)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    username,
+                    hashed_password,
+                    phone,
+                    referral_code,
+                    referrer_id
+                )
             )
-        )
+            connection.commit()
+        except psycopg.errors.UniqueViolation:
+            connection.rollback()
+            connection.close()
+            flash(
+                "That username or M-Pesa number is already registered. Please log in to your existing account.",
+                "error"
+            )
+            return redirect(url_for("register"))
 
-        connection.commit()
         connection.close()
 
         flash(
@@ -883,7 +904,7 @@ def login():
             """
             SELECT id, username, password
             FROM users
-            WHERE username = ?
+            WHERE LOWER(username) = LOWER(?)
             """,
             (username,)
         ).fetchone()
@@ -1425,7 +1446,7 @@ def wallet_deposit():
             "success"
         )
 
-    except sqlite3.Error:
+    except psycopg.Error:
         connection.rollback()
 
         flash(
