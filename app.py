@@ -1521,6 +1521,12 @@ def mpesa_callback():
     callback = (body.get("Body") or {}).get("stkCallback") or {}
     checkout_id = callback.get("CheckoutRequestID")
     result_code = callback.get("ResultCode")
+    app.logger.warning(
+        "MPESA CALLBACK RESULT: code=%s description=%s checkout_present=%s",
+        result_code,
+        callback.get("ResultDesc"),
+        bool(checkout_id)
+    )
     metadata_items = ((callback.get("CallbackMetadata") or {}).get("Item") or [])
     metadata = {item.get("Name"): item.get("Value") for item in metadata_items if isinstance(item, dict)}
     receipt = metadata.get("MpesaReceiptNumber")
