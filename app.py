@@ -1510,7 +1510,13 @@ def verify_stk_payment_with_daraja(checkout_request_id, timestamp):
         headers={"Authorization": f"Bearer {token}"},
         timeout=25
     )
-    response.raise_for_status()
+    if response.status_code != 200:
+        app.logger.error(
+            "STK QUERY FAILED: HTTP %s - %s",
+            response.status_code,
+            response.text
+        )
+        return False, response.json()
     result = response.json()
     return str(result.get("ResultCode")) == "0", result
 
